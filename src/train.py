@@ -12,6 +12,7 @@ from model import create_model
 
 from config import (
     CSV_FILE,
+    PATH_COLUMN,
     BATCH_SIZE,
     NUM_EPOCHS,
     LEARNING_RATE,
@@ -168,15 +169,15 @@ def validate(
 
 def main():
 
-    # -------------------------
+    # =========================
     # Reproducibility
-    # -------------------------
+    # =========================
 
     set_seed(SEED)
 
-    # -------------------------
+    # =========================
     # Directories
-    # -------------------------
+    # =========================
 
     os.makedirs(
         MODEL_DIR,
@@ -191,28 +192,32 @@ def main():
     print("Epochs:", NUM_EPOCHS)
     print("Learning rate:", LEARNING_RATE)
     print("Weight decay:", WEIGHT_DECAY)
+    print("CSV file:", CSV_FILE)
+    print("Path column:", PATH_COLUMN)
 
-    # -------------------------
+    # =========================
     # Load datasets
-    # -------------------------
+    # =========================
 
     print("\n===== LOADING DATA =====")
 
     train_dataset = RSNADataset(
         CSV_FILE,
         "train",
-        get_transforms(train=True)
+        get_transforms(train=True),
+        path_column=PATH_COLUMN
     )
 
     val_dataset = RSNADataset(
         CSV_FILE,
         "val",
-        get_transforms(train=False)
+        get_transforms(train=False),
+        path_column=PATH_COLUMN
     )
 
-    # -------------------------
+    # =========================
     # DataLoaders
-    # -------------------------
+    # =========================
 
     train_loader = DataLoader(
         train_dataset,
@@ -250,9 +255,9 @@ def main():
         len(val_loader)
     )
 
-    # -------------------------
+    # =========================
     # Create model
-    # -------------------------
+    # =========================
 
     print("\n===== CREATING MODEL =====")
 
@@ -265,9 +270,9 @@ def main():
         model.classifier
     )
 
-    # -------------------------
+    # =========================
     # Class weights
-    # -------------------------
+    # =========================
 
     train_labels = (
         train_dataset.df["pneumonia"]
@@ -293,17 +298,17 @@ def main():
         class_weights
     )
 
-    # -------------------------
-    # Loss
-    # -------------------------
+    # =========================
+    # Loss function
+    # =========================
 
     criterion = nn.CrossEntropyLoss(
         weight=class_weights
     )
 
-    # -------------------------
+    # =========================
     # Optimizer
-    # -------------------------
+    # =========================
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -311,9 +316,9 @@ def main():
         weight_decay=WEIGHT_DECAY
     )
 
-    # -------------------------
-    # Training
-    # -------------------------
+    # =========================
+    # Best model tracking
+    # =========================
 
     best_val_loss = float("inf")
 
@@ -322,13 +327,25 @@ def main():
         "densenet121_centralized_best.pth"
     )
 
+    print(
+        "\nBest model will be saved to:",
+        best_model_path
+    )
+
+    # =========================
+    # Training
+    # =========================
+
     print("\n===== STARTING TRAINING =====")
 
     for epoch in range(NUM_EPOCHS):
 
         start_time = time.time()
 
+        # -------------------------
         # Training
+        # -------------------------
+
         train_loss, train_accuracy = train_one_epoch(
             model,
             train_loader,
@@ -337,7 +354,10 @@ def main():
             DEVICE
         )
 
+        # -------------------------
         # Validation
+        # -------------------------
+
         val_loss, val_accuracy = validate(
             model,
             val_loader,
@@ -349,12 +369,17 @@ def main():
             time.time() - start_time
         )
 
+        # -------------------------
+        # Epoch results
+        # -------------------------
+
         print(
             f"\nEpoch [{epoch + 1}/{NUM_EPOCHS}]"
         )
 
         print(
-            f"Train Loss: {train_loss:.4f}"
+            f"Train Loss: "
+            f"{train_loss:.4f}"
         )
 
         print(
@@ -386,13 +411,26 @@ def main():
             best_val_loss = val_loss
 
             checkpoint = {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "epoch": epoch + 1,
-                "val_loss": val_loss,
-                "val_accuracy": val_accuracy,
-                "model_name": "densenet121",
-                "seed": SEED,
+                "model_state_dict":
+                    model.state_dict(),
+
+                "optimizer_state_dict":
+                    optimizer.state_dict(),
+
+                "epoch":
+                    epoch + 1,
+
+                "val_loss":
+                    val_loss,
+
+                "val_accuracy":
+                    val_accuracy,
+
+                "model_name":
+                    "densenet121",
+
+                "seed":
+                    SEED,
             }
 
             torch.save(
@@ -405,7 +443,13 @@ def main():
                 best_model_path
             )
 
-    print("\n===== TRAINING COMPLETE =====")
+    # =========================
+    # Training complete
+    # =========================
+
+    print(
+        "\n===== TRAINING COMPLETE ====="
+    )
 
     print(
         "Best validation loss:",
