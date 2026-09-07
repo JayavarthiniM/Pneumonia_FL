@@ -1,0 +1,28 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# RSNA dataset and local data
+data/
+
+# Trained models
+models/*.pth
+models/*.pt
+models/*.ckpt
+
+# Training outputs
+results/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
