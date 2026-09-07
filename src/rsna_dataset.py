@@ -9,14 +9,23 @@ from torchvision import transforms
 
 class RSNADataset(Dataset):
 
-    def __init__(self, csv_file, split, transform=None):
+    def __init__(
+        self,
+        csv_file,
+        split,
+        transform=None,
+        path_column="dicom_path"
+    ):
 
         self.df = pd.read_csv(csv_file)
 
         # Select requested split
-        self.df = self.df[self.df["split"] == split].reset_index(drop=True)
+        self.df = self.df[
+            self.df["split"] == split
+        ].reset_index(drop=True)
 
         self.transform = transform
+        self.path_column = path_column
 
         print(f"{split} images: {len(self.df)}")
 
@@ -28,10 +37,14 @@ class RSNADataset(Dataset):
         row = self.df.iloc[index]
 
         # Read DICOM
-        dicom = pydicom.dcmread(row["dicom_path"])
+        dicom = pydicom.dcmread(
+            row[self.path_column]
+        )
 
         # Extract pixel data
-        image = dicom.pixel_array.astype(np.float32)
+        image = dicom.pixel_array.astype(
+            np.float32
+        )
 
         # Normalize pixel values to 0-255
         image -= image.min()
@@ -41,10 +54,14 @@ class RSNADataset(Dataset):
 
         image *= 255.0
 
-        image = image.astype(np.uint8)
+        image = image.astype(
+            np.uint8
+        )
 
-        # Convert grayscale to PIL image
-        image = Image.fromarray(image).convert("RGB")
+        # Convert grayscale to RGB
+        image = Image.fromarray(
+            image
+        ).convert("RGB")
 
         # Apply transforms
         if self.transform:
@@ -64,29 +81,55 @@ def get_transforms(train=True):
     if train:
 
         return transforms.Compose([
-            transforms.Resize((224, 224)),
 
-            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.Resize(
+                (224, 224)
+            ),
 
-            transforms.RandomRotation(degrees=5),
+            transforms.RandomHorizontalFlip(
+                p=0.5
+            ),
+
+            transforms.RandomRotation(
+                degrees=5
+            ),
 
             transforms.ToTensor(),
 
             transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
+                mean=[
+                    0.485,
+                    0.456,
+                    0.406
+                ],
+                std=[
+                    0.229,
+                    0.224,
+                    0.225
+                ]
             )
         ])
 
     else:
 
         return transforms.Compose([
-            transforms.Resize((224, 224)),
+
+            transforms.Resize(
+                (224, 224)
+            ),
 
             transforms.ToTensor(),
 
             transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
+                mean=[
+                    0.485,
+                    0.456,
+                    0.406
+                ],
+                std=[
+                    0.229,
+                    0.224,
+                    0.225
+                ]
             )
         ])
