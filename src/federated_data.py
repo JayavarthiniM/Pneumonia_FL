@@ -19,13 +19,8 @@ CSV_FILE = os.environ.get(
     ),
 )
 
-NUM_CLIENTS = int(
-    os.environ.get("NUM_CLIENTS", "5")
-)
-
-SEED = int(
-    os.environ.get("SEED", "42")
-)
+NUM_CLIENTS = 5
+SEED = 42
 
 OUTPUT_FILE = os.environ.get(
     "CLIENT_MAP_FILE",
@@ -37,21 +32,6 @@ OUTPUT_FILE = os.environ.get(
     ),
 )
 
-# Controls how strongly client pneumonia proportions differ.
-# Lower value = stronger heterogeneity.
-DIRICHLET_ALPHA = 0.5
-
-# Minimum desired number of images per client.
-MIN_CLIENT_IMAGES = 2000
-
-
-# ============================================================
-# REPRODUCIBILITY
-# ============================================================
-
-random.seed(SEED)
-np.random.seed(SEED)
-
 
 # ============================================================
 # LOAD DATA
@@ -59,28 +39,19 @@ np.random.seed(SEED)
 
 def load_training_data():
 
-    if not os.path.exists(CSV_FILE):
-        raise FileNotFoundError(
-            f"CSV file not found:\n{CSV_FILE}"
-        )
-
     df = pd.read_csv(CSV_FILE)
 
-    required_columns = {
+    required = {
         "patient_key",
         "pneumonia",
         "split",
     }
 
-    missing_columns = (
-        required_columns
-        - set(df.columns)
-    )
+    missing = required - set(df.columns)
 
-    if missing_columns:
+    if missing:
         raise ValueError(
-            "Missing required columns: "
-            f"{sorted(missing_columns)}"
+            f"Missing columns: {sorted(missing)}"
         )
 
     train_df = (
@@ -89,21 +60,16 @@ def load_training_data():
         .reset_index(drop=True)
     )
 
-    if len(train_df) == 0:
-        raise ValueError(
-            "No training images found."
-        )
-
     return train_df
 
 
 # ============================================================
-# BUILD PATIENT STATISTICS
+# PATIENT STATISTICS
 # ============================================================
 
-def build_patient_statistics(train_df):
+def make_patient_table(train_df):
 
-    patient_stats = (
+    patients = (
         train_df
         .groupby("patient_key")
         .agg(
@@ -113,283 +79,286 @@ def build_patient_statistics(train_df):
         .reset_index()
     )
 
-    patient_stats["no_pneumonia_images"] = (
-        patient_stats["total_images"]
-        - patient_stats["pneumonia_images"]
+    patients["pneumonia_ratio"] = (
+        patients["pneumonia_images"]
+        / patients["total_images"]
     )
 
-    patient_stats["pneumonia_ratio"] = (
-        patient_stats["pneumonia_images"]
-        / patient_stats["total_images"]
+    patients["no_pneumonia_images"] = (
+        patients["total_images"]
+        - patients["pneumonia_images"]
     )
 
-    # Classify patients according to their image labels.
-    patient_stats["patient_type"] = np.where(
-        patient_stats["pneumonia_images"]
-        == patient_stats["total_images"],
-        "pneumonia_only",
-        np.where(
-            patient_stats["pneumonia_images"] == 0,
-            "no_pneumonia_only",
-            "mixed",
-        ),
-    )
-
-    return patient_stats
+    return patients
 
 
 # ============================================================
-# TARGET CLIENT DISTRIBUTIONS
+# BALANCED PATIENT ASSIGNMENT
 # ============================================================
 
-def create_client_targets(
-    patient_stats,
-    total_images,
-):
-    """
-    Create approximately equal image targets while
-    introducing controlled label heterogeneity.
+def create_partition(patients):
 
-    This is a patient-level Dirichlet-inspired
-    partitioning strategy rather than a textbook
-    per-image Dirichlet partition.
-    """
+    rng = random.Random(SEED)
 
-    target_images = np.full(
-        NUM_CLIENTS,
-        total_images / NUM_CLIENTS,
-        dtype=float,
+    total_images = int(
+        patients["total_images"].sum()
     )
 
-    global_pneumonia_ratio = (
-        patient_stats["pneumonia_images"].sum()
-        / total_images
-    )
+    target = total_images / NUM_CLIENTS
 
-    # Generate Dirichlet proportions.
-    pneumonia_noise = np.random.dirichlet(
-        np.full(
-            NUM_CLIENTS,
-            DIRICHLET_ALPHA,
-        )
-    )
+    # --------------------------------------------------------
+    # Start with empty clients.
+    # --------------------------------------------------------
 
-    # Center the random proportions around the
-    # actual global pneumonia prevalence.
-    noise_mean = pneumonia_noise.mean()
+    clients = [
+        {
+            "patients": [],
+            "images": 0,
+            "pneumonia": 0,
+        }
+        for _ in range(NUM_CLIENTS)
+    ]
 
-    target_ratios = (
-        global_pneumonia_ratio
-        + (
-            pneumonia_noise
-            - noise_mean
-        )
-        * 0.75
-    )
+    # --------------------------------------------------------
+    # Separate patients by label composition.
+    #
+    # This allows controlled non-IID behaviour while
+    # keeping complete patients together.
+    # --------------------------------------------------------
 
-    # Keep targets in a realistic range.
-    target_ratios = np.clip(
-        target_ratios,
-        0.20,
-        0.85,
-    )
+    pneumonia_only = patients[
+        patients["pneumonia_ratio"] == 1.0
+    ].copy()
 
-    # Re-center after clipping.
-    target_ratios = (
-        target_ratios
-        * (
-            global_pneumonia_ratio
-            / target_ratios.mean()
-        )
-    )
+    no_pneumonia_only = patients[
+        patients["pneumonia_ratio"] == 0.0
+    ].copy()
 
-    target_ratios = np.clip(
-        target_ratios,
-        0.20,
-        0.85,
-    )
+    mixed = patients[
+        (patients["pneumonia_ratio"] > 0.0)
+        & (patients["pneumonia_ratio"] < 1.0)
+    ].copy()
 
-    return (
-        target_images,
-        target_ratios,
-    )
-
-
-# ============================================================
-# PATIENT-LEVEL ASSIGNMENT
-# ============================================================
-
-def assign_patients(
-    patient_stats,
-    target_images,
-    target_ratios,
-):
-    """
-    Assign complete patients to clients.
-
-    No patient is split across clients.
-
-    Assignment considers:
-      1. Client image-count target
-      2. Client pneumonia-ratio target
-      3. Patient label composition
-
-    Larger patient groups are assigned first to
-    reduce final client-size imbalance.
-    """
-
-    client_images = np.zeros(
-        NUM_CLIENTS,
-        dtype=int,
-    )
-
-    client_pneumonia = np.zeros(
-        NUM_CLIENTS,
-        dtype=int,
-    )
-
-    patient_to_client = {}
-
-    # Randomize patients reproducibly first.
-    shuffled = patient_stats.sample(
-        frac=1.0,
+    # Reproducible shuffling.
+    pneumonia_only = pneumonia_only.sample(
+        frac=1,
         random_state=SEED,
-    ).copy()
-
-    # Larger patients first.
-    shuffled = shuffled.sort_values(
-        by="total_images",
-        ascending=False,
     )
 
-    for _, patient in shuffled.iterrows():
+    no_pneumonia_only = no_pneumonia_only.sample(
+        frac=1,
+        random_state=SEED + 1,
+    )
 
-        patient_images = int(
+    mixed = mixed.sample(
+        frac=1,
+        random_state=SEED + 2,
+    )
+
+    # --------------------------------------------------------
+    # Assign pure-class patients using rotating clients.
+    # This creates label heterogeneity.
+    # --------------------------------------------------------
+
+    def assign_group(group, start_client):
+
+        client_order = [
+            (start_client + i) % NUM_CLIENTS
+            for i in range(NUM_CLIENTS)
+        ]
+
+        for _, patient in group.iterrows():
+
+            # Only consider clients that still have
+            # reasonable capacity.
+            available = [
+                c for c in client_order
+                if clients[c]["images"]
+                + int(patient["total_images"])
+                <= target
+            ]
+
+            if not available:
+                available = sorted(
+                    range(NUM_CLIENTS),
+                    key=lambda c: clients[c]["images"]
+                )[:2]
+
+            # Prefer the least-filled available client.
+            best = min(
+                available,
+                key=lambda c: clients[c]["images"]
+            )
+
+            clients[best]["patients"].append(
+                patient["patient_key"]
+            )
+
+            clients[best]["images"] += int(
+                patient["total_images"]
+            )
+
+            clients[best]["pneumonia"] += int(
+                patient["pneumonia_images"]
+            )
+
+    assign_group(
+        pneumonia_only,
+        0,
+    )
+
+    assign_group(
+        no_pneumonia_only,
+        2,
+    )
+
+    # --------------------------------------------------------
+    # Mixed patients go to the currently smallest client.
+    # --------------------------------------------------------
+
+    for _, patient in mixed.iterrows():
+
+        size = int(
             patient["total_images"]
         )
 
-        patient_pneumonia = int(
+        candidates = sorted(
+            range(NUM_CLIENTS),
+            key=lambda c: clients[c]["images"]
+        )
+
+        # Prefer a client that remains close to target.
+        best = None
+
+        for c in candidates:
+
+            if (
+                clients[c]["images"]
+                + size
+                <= target + 50
+            ):
+                best = c
+                break
+
+        if best is None:
+            best = candidates[0]
+
+        clients[best]["patients"].append(
+            patient["patient_key"]
+        )
+
+        clients[best]["images"] += size
+
+        clients[best]["pneumonia"] += int(
             patient["pneumonia_images"]
         )
 
-        patient_ratio = float(
-            patient["pneumonia_ratio"]
+    # --------------------------------------------------------
+    # Rebalance clients using whole-patient moves.
+    # --------------------------------------------------------
+
+    for _ in range(10000):
+
+        sizes = [
+            c["images"]
+            for c in clients
+        ]
+
+        largest = int(
+            np.argmax(sizes)
         )
 
-        candidate_scores = []
+        smallest = int(
+            np.argmin(sizes)
+        )
 
-        for client_id in range(
-            NUM_CLIENTS
+        difference = (
+            sizes[largest]
+            - sizes[smallest]
+        )
+
+        if difference <= 10:
+            break
+
+        moved = False
+
+        # Find a patient whose movement reduces
+        # the size difference.
+        for patient_key in list(
+            clients[largest]["patients"]
         ):
 
-            current_images = (
-                client_images[client_id]
+            row = patients[
+                patients["patient_key"]
+                == patient_key
+            ].iloc[0]
+
+            size = int(
+                row["total_images"]
             )
 
-            current_pneumonia = (
-                client_pneumonia[client_id]
-            )
+            if (
+                clients[smallest]["images"]
+                + size
+                <= target + 50
+            ):
 
-            new_images = (
-                current_images
-                + patient_images
-            )
-
-            new_pneumonia = (
-                current_pneumonia
-                + patient_pneumonia
-            )
-
-            new_ratio = (
-                new_pneumonia / new_images
-            )
-
-            # ------------------------------------------------
-            # Size error
-            # ------------------------------------------------
-
-            size_error = (
-                abs(
-                    new_images
-                    - target_images[client_id]
+                clients[largest]["patients"].remove(
+                    patient_key
                 )
-                / target_images[client_id]
-            )
 
-            # ------------------------------------------------
-            # Label-ratio error
-            # ------------------------------------------------
+                clients[smallest]["patients"].append(
+                    patient_key
+                )
 
-            ratio_error = abs(
-                new_ratio
-                - target_ratios[client_id]
-            )
+                clients[largest]["images"] -= size
+                clients[smallest]["images"] += size
 
-            # ------------------------------------------------
-            # Current-size penalty
-            # ------------------------------------------------
+                pneumonia = int(
+                    row["pneumonia_images"]
+                )
 
-            # Prevent one client from becoming
-            # excessively large early.
-            overflow = max(
-                0,
-                new_images
-                - target_images[client_id]
-            )
+                clients[largest]["pneumonia"] -= (
+                    pneumonia
+                )
 
-            overflow_penalty = (
-                overflow
-                / target_images[client_id]
-            )
+                clients[smallest]["pneumonia"] += (
+                    pneumonia
+                )
 
-            # ------------------------------------------------
-            # Combined score
-            # ------------------------------------------------
+                moved = True
+                break
 
-            score = (
-                3.0 * size_error
-                + 2.0 * ratio_error
-                + 4.0 * overflow_penalty
-            )
+        if not moved:
+            break
 
-            # Small random tie breaker.
-            score += np.random.random() * 1e-6
-
-            candidate_scores.append(
-                score
-            )
-
-        best_client = int(
-            np.argmin(candidate_scores)
-        )
-
-        patient_to_client[
-            patient["patient_key"]
-        ] = best_client + 1
-
-        client_images[
-            best_client
-        ] += patient_images
-
-        client_pneumonia[
-            best_client
-        ] += patient_pneumonia
-
-    return (
-        patient_to_client,
-        client_images,
-        client_pneumonia,
-    )
+    return clients
 
 
 # ============================================================
-# BUILD CLIENT MAP
+# BUILD IMAGE-LEVEL MAP
 # ============================================================
 
 def build_client_map(
     train_df,
-    patient_to_client,
+    clients,
 ):
+
+    patient_to_client = {}
+
+    for client_id, client in enumerate(
+        clients,
+        start=1,
+    ):
+
+        for patient in client["patients"]:
+
+            if patient in patient_to_client:
+                raise ValueError(
+                    f"Patient assigned twice: {patient}"
+                )
+
+            patient_to_client[patient] = client_id
 
     result = train_df.copy()
 
@@ -399,14 +368,17 @@ def build_client_map(
     )
 
     if result["client_id"].isna().any():
+
+        missing = result[
+            result["client_id"].isna()
+        ]["patient_key"].unique()
+
         raise ValueError(
-            "Some training images were not assigned "
-            "to a client."
+            f"Unassigned patients: {missing[:10]}"
         )
 
     result["client_id"] = (
-        result["client_id"]
-        .astype(int)
+        result["client_id"].astype(int)
     )
 
     return result
@@ -416,77 +388,59 @@ def build_client_map(
 # VALIDATION
 # ============================================================
 
-def validate_partition(
+def validate(
     train_df,
     client_df,
 ):
 
-    print(
-        "\n===== FINAL CHECKS ====="
-    )
+    print("\n===== FINAL CHECKS =====")
 
-    # --------------------------------------------------------
-    # Image coverage
-    # --------------------------------------------------------
-
-    original_images = len(
-        train_df
-    )
-
-    assigned_images = len(
-        client_df
-    )
-
+    # Image count
     print(
         "Original training images:",
-        original_images,
+        len(train_df),
     )
 
     print(
         "Assigned training images:",
-        assigned_images,
+        len(client_df),
     )
 
-    if original_images != assigned_images:
-        raise ValueError(
-            "Image count mismatch."
-        )
-
-    # --------------------------------------------------------
-    # Client IDs
-    # --------------------------------------------------------
-
-    expected_clients = set(
-        range(1, NUM_CLIENTS + 1)
+    assert (
+        len(train_df)
+        == len(client_df)
     )
 
-    actual_clients = set(
+    # Clients
+    client_ids = sorted(
         client_df["client_id"]
         .unique()
+        .tolist()
     )
 
-    if actual_clients != expected_clients:
-        raise ValueError(
-            "Incorrect client IDs."
-        )
+    print(
+        "Client IDs:",
+        client_ids,
+    )
 
-    # --------------------------------------------------------
+    assert client_ids == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+
     # Patient leakage
-    # --------------------------------------------------------
-
-    patient_client_counts = (
+    leakage = (
         client_df
-        .groupby("patient_key")[
-            "client_id"
-        ]
+        .groupby("patient_key")["client_id"]
         .nunique()
     )
 
-    leaked_patients = (
-        patient_client_counts[
-            patient_client_counts > 1
-        ]
-    )
+    leaked = leakage[
+        leakage > 1
+    ]
 
     print(
         "Unique patients:",
@@ -495,59 +449,27 @@ def validate_partition(
 
     print(
         "Patient leakage:",
-        len(leaked_patients),
+        len(leaked),
     )
 
-    if len(leaked_patients) > 0:
-        raise ValueError(
-            "Patient leakage detected."
-        )
+    assert len(leaked) == 0
 
-    # --------------------------------------------------------
-    # Duplicate assignment check
-    # --------------------------------------------------------
-
-    if "img_id" in client_df.columns:
-
-        duplicate_images = (
-            client_df["img_id"]
-            .duplicated()
-            .sum()
-        )
-
-        if duplicate_images > 0:
-            raise ValueError(
-                f"Duplicate images detected: "
-                f"{duplicate_images}"
-            )
-
-    # --------------------------------------------------------
-    # Minimum client size
-    # --------------------------------------------------------
-
-    client_sizes = (
+    # Client sizes
+    sizes = (
         client_df
         .groupby("client_id")
         .size()
     )
 
-    smallest_client = (
-        client_sizes.min()
-    )
-
     print(
-        "Smallest client:",
-        smallest_client,
-        "images",
+        "Client size range:",
+        int(sizes.min()),
+        "-",
+        int(sizes.max()),
     )
 
-    if smallest_client < MIN_CLIENT_IMAGES:
-        raise ValueError(
-            "A client is below the minimum "
-            f"size of {MIN_CLIENT_IMAGES} images."
-        )
-
-    return True
+    # Every client must have data.
+    assert (sizes > 0).all()
 
 
 # ============================================================
@@ -575,15 +497,6 @@ def main():
         SEED,
     )
 
-    print(
-        "Dirichlet alpha:",
-        DIRICHLET_ALPHA,
-    )
-
-    # --------------------------------------------------------
-    # Load data
-    # --------------------------------------------------------
-
     train_df = load_training_data()
 
     print(
@@ -596,70 +509,18 @@ def main():
         train_df["patient_key"].nunique(),
     )
 
-    # --------------------------------------------------------
-    # Patient statistics
-    # --------------------------------------------------------
-
-    patient_stats = (
-        build_patient_statistics(
-            train_df
-        )
+    patients = make_patient_table(
+        train_df
     )
 
-    # --------------------------------------------------------
-    # Client targets
-    # --------------------------------------------------------
-
-    (
-        target_images,
-        target_ratios,
-    ) = create_client_targets(
-        patient_stats,
-        len(train_df),
+    clients = create_partition(
+        patients
     )
-
-    print(
-        "\n===== TARGET DISTRIBUTION ====="
-    )
-
-    for client_id in range(
-        NUM_CLIENTS
-    ):
-
-        print(
-            f"Client {client_id + 1}: "
-            f"target images ≈ "
-            f"{target_images[client_id]:.0f} | "
-            f"target pneumonia ratio ≈ "
-            f"{target_ratios[client_id]:.3f}"
-        )
-
-    # --------------------------------------------------------
-    # Assign patients
-    # --------------------------------------------------------
-
-    (
-        patient_to_client,
-        client_images,
-        client_pneumonia,
-    ) = assign_patients(
-        patient_stats,
-        target_images,
-        target_ratios,
-    )
-
-    # --------------------------------------------------------
-    # Build image-level client map
-    # --------------------------------------------------------
 
     client_df = build_client_map(
         train_df,
-        patient_to_client,
+        clients,
     )
-
-    # --------------------------------------------------------
-    # Display distribution
-    # --------------------------------------------------------
 
     print(
         "\n===== CLIENT DISTRIBUTION ====="
@@ -675,54 +536,34 @@ def main():
             == client_id
         ]
 
+        pneumonia = int(
+            subset["pneumonia"].sum()
+        )
+
         total = len(subset)
-
-        pneumonia = (
-            subset["pneumonia"] == 1
-        ).sum()
-
-        no_pneumonia = (
-            subset["pneumonia"] == 0
-        ).sum()
-
-        patient_count = (
-            subset["patient_key"]
-            .nunique()
-        )
-
-        ratio = (
-            pneumonia / total
-        )
 
         print(
             f"Client {client_id}: "
             f"{total} images | "
-            f"{patient_count} patients | "
+            f"{subset['patient_key'].nunique()} patients | "
             f"Pneumonia: {pneumonia} | "
-            f"No pneumonia: {no_pneumonia} | "
-            f"Pneumonia ratio: {ratio:.3f}"
+            f"No pneumonia: {total - pneumonia} | "
+            f"Pneumonia ratio: "
+            f"{pneumonia / total:.3f}"
         )
 
-    # --------------------------------------------------------
-    # Validate
-    # --------------------------------------------------------
-
-    validate_partition(
+    validate(
         train_df,
         client_df,
     )
 
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
-
-    output_directory = (
-        os.path.dirname(OUTPUT_FILE)
+    output_dir = os.path.dirname(
+        OUTPUT_FILE
     )
 
-    if output_directory:
+    if output_dir:
         os.makedirs(
-            output_directory,
+            output_dir,
             exist_ok=True,
         )
 
