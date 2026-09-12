@@ -26,8 +26,6 @@ from config import (
 
 
 def set_seed(seed):
-    """Set random seeds for reproducibility."""
-
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -37,8 +35,6 @@ def set_seed(seed):
 
 
 def calculate_class_weights(labels, device):
-    """Calculate inverse-frequency class weights."""
-
     class_counts = np.bincount(labels)
 
     class_weights = len(labels) / (
@@ -59,8 +55,6 @@ def train_one_epoch(
     optimizer,
     device
 ):
-    """Train model for one epoch."""
-
     model.train()
 
     running_loss = 0.0
@@ -120,8 +114,6 @@ def validate(
     criterion,
     device
 ):
-    """Evaluate model on validation data."""
-
     model.eval()
 
     running_loss = 0.0
@@ -171,15 +163,7 @@ def validate(
 
 def main():
 
-    # =========================
-    # Reproducibility
-    # =========================
-
     set_seed(SEED)
-
-    # =========================
-    # Directories
-    # =========================
 
     os.makedirs(
         MODEL_DIR,
@@ -191,7 +175,9 @@ def main():
         exist_ok=True
     )
 
-    print("===== CENTRALIZED TRAINING =====")
+    print(
+        "===== CENTRALIZED TRAINING ====="
+    )
 
     print("Device:", DEVICE)
     print("Model: DenseNet121")
@@ -202,11 +188,9 @@ def main():
     print("CSV file:", CSV_FILE)
     print("Path column:", PATH_COLUMN)
 
-    # =========================
-    # Load datasets
-    # =========================
-
-    print("\n===== LOADING DATA =====")
+    print(
+        "\n===== LOADING DATA ====="
+    )
 
     train_dataset = RSNADataset(
         CSV_FILE,
@@ -221,10 +205,6 @@ def main():
         get_transforms(train=False),
         path_column=PATH_COLUMN
     )
-
-    # =========================
-    # DataLoaders
-    # =========================
 
     train_loader = DataLoader(
         train_dataset,
@@ -262,11 +242,9 @@ def main():
         len(val_loader)
     )
 
-    # =========================
-    # Create model
-    # =========================
-
-    print("\n===== CREATING MODEL =====")
+    print(
+        "\n===== CREATING MODEL ====="
+    )
 
     model = create_model()
 
@@ -276,10 +254,6 @@ def main():
         "Classifier:",
         model.classifier
     )
-
-    # =========================
-    # Class weights
-    # =========================
 
     train_labels = (
         train_dataset.df["pneumonia"]
@@ -305,17 +279,9 @@ def main():
         class_weights
     )
 
-    # =========================
-    # Loss function
-    # =========================
-
     criterion = nn.CrossEntropyLoss(
         weight=class_weights
     )
-
-    # =========================
-    # Optimizer
-    # =========================
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -323,15 +289,16 @@ def main():
         weight_decay=WEIGHT_DECAY
     )
 
-    # =========================
-    # Training history
-    # =========================
+    # Reduce learning rate when validation
+    # loss stops improving.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=1
+    )
 
     history = []
-
-    # =========================
-    # Best model tracking
-    # =========================
 
     best_val_loss = float("inf")
 
@@ -355,19 +322,13 @@ def main():
         history_path
     )
 
-    # =========================
-    # Training
-    # =========================
-
-    print("\n===== STARTING TRAINING =====")
+    print(
+        "\n===== STARTING TRAINING ====="
+    )
 
     for epoch in range(NUM_EPOCHS):
 
         start_time = time.time()
-
-        # -------------------------
-        # Training
-        # -------------------------
 
         train_loss, train_accuracy = train_one_epoch(
             model,
@@ -377,10 +338,6 @@ def main():
             DEVICE
         )
 
-        # -------------------------
-        # Validation
-        # -------------------------
-
         val_loss, val_accuracy = validate(
             model,
             val_loader,
@@ -388,13 +345,13 @@ def main():
             DEVICE
         )
 
+        scheduler.step(val_loss)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+
         elapsed_time = (
             time.time() - start_time
         )
-
-        # -------------------------
-        # Store history
-        # -------------------------
 
         epoch_record = {
             "epoch": epoch + 1,
@@ -402,6 +359,7 @@ def main():
             "train_accuracy": train_accuracy,
             "val_loss": val_loss,
             "val_accuracy": val_accuracy,
+            "learning_rate": current_lr,
             "time_minutes": elapsed_time / 60
         }
 
@@ -418,42 +376,33 @@ def main():
             index=False
         )
 
-        # -------------------------
-        # Epoch results
-        # -------------------------
-
         print(
             f"\nEpoch [{epoch + 1}/{NUM_EPOCHS}]"
         )
 
         print(
-            f"Train Loss: "
-            f"{train_loss:.4f}"
+            f"Train Loss: {train_loss:.4f}"
         )
 
         print(
-            f"Train Accuracy: "
-            f"{train_accuracy:.4f}"
+            f"Train Accuracy: {train_accuracy:.4f}"
         )
 
         print(
-            f"Validation Loss: "
-            f"{val_loss:.4f}"
+            f"Validation Loss: {val_loss:.4f}"
         )
 
         print(
-            f"Validation Accuracy: "
-            f"{val_accuracy:.4f}"
+            f"Validation Accuracy: {val_accuracy:.4f}"
         )
 
         print(
-            f"Time: "
-            f"{elapsed_time / 60:.2f} minutes"
+            f"Learning Rate: {current_lr:.6f}"
         )
 
-        # -------------------------
-        # Save best model
-        # -------------------------
+        print(
+            f"Time: {elapsed_time / 60:.2f} minutes"
+        )
 
         if val_loss < best_val_loss:
 
@@ -491,10 +440,6 @@ def main():
                 "Best model saved:",
                 best_model_path
             )
-
-    # =========================
-    # Training complete
-    # =========================
 
     print(
         "\n===== TRAINING COMPLETE ====="
