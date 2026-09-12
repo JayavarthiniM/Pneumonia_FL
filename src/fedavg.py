@@ -29,27 +29,35 @@ from config import (
 # FEDERATED CONFIGURATION
 # ============================================================
 
-NUM_CLIENTS = 5
+NUM_CLIENTS = int(os.environ.get("NUM_CLIENTS", "5"))
 
-# Number of federated communication rounds.
-NUM_ROUNDS = 5
+# Default = 5 communication rounds.
+# Can temporarily override with:
+# os.environ["NUM_ROUNDS"] = "1"
+NUM_ROUNDS = int(os.environ.get("NUM_ROUNDS", "5"))
 
 # Number of local epochs performed by each client.
-LOCAL_EPOCHS = 1
+LOCAL_EPOCHS = int(os.environ.get("LOCAL_EPOCHS", "1"))
 
+# Client partition file.
 CLIENT_MAP_FILE = os.environ.get(
     "CLIENT_MAP_FILE",
-    r"data\rsna\mapping\federated_client_map.csv"
+    os.path.join(
+        "data",
+        "rsna",
+        "mapping",
+        "federated_client_map.csv",
+    ),
 )
 
 BEST_MODEL_PATH = os.path.join(
     MODEL_DIR,
-    "densenet121_fedavg_best.pth"
+    "densenet121_fedavg_best.pth",
 )
 
 HISTORY_PATH = os.path.join(
     RESULTS_DIR,
-    "fedavg_training_history.csv"
+    "fedavg_training_history.csv",
 )
 
 
@@ -58,7 +66,6 @@ HISTORY_PATH = os.path.join(
 # ============================================================
 
 def set_seed(seed):
-
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -77,27 +84,26 @@ def train_local_model(
     criterion,
     optimizer,
     device,
-    local_epochs
+    local_epochs,
 ):
-
     model.train()
 
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
 
-    for _ in range(local_epochs):
+    for epoch in range(local_epochs):
 
         for images, labels in loader:
 
             images = images.to(
                 device,
-                non_blocking=True
+                non_blocking=True,
             )
 
             labels = labels.to(
                 device,
-                non_blocking=True
+                non_blocking=True,
             )
 
             optimizer.zero_grad(
@@ -108,7 +114,7 @@ def train_local_model(
 
             loss = criterion(
                 outputs,
-                labels
+                labels,
             )
 
             loss.backward()
@@ -116,8 +122,7 @@ def train_local_model(
             optimizer.step()
 
             total_loss += (
-                loss.item() *
-                images.size(0)
+                loss.item() * images.size(0)
             )
 
             predictions = outputs.argmax(
@@ -139,10 +144,10 @@ def train_local_model(
     )
 
     return (
-        model.state_dict(),
+        copy.deepcopy(model.state_dict()),
         average_loss,
         accuracy,
-        total_samples
+        total_samples,
     )
 
 
@@ -152,38 +157,52 @@ def train_local_model(
 
 def fedavg(
     client_states,
-    client_sizes
+    client_sizes,
 ):
+    """
+    Standard sample-weighted FedAvg.
 
-    total_samples = sum(
-        client_sizes
-    )
+    Floating-point parameters/buffers are averaged
+    using the number of training samples on each client.
 
-    global_state = copy.deepcopy(
-        client_states[0]
-    )
+    Non-floating buffers are copied from the first client
+    instead of attempting invalid floating-point averaging.
+    """
 
-    for key in global_state:
+    total_samples = sum(client_sizes)
 
-        global_state[key] = (
-            client_states[0][key]
-            * (
-                client_sizes[0]
-                / total_samples
+    global_state = {}
+
+    for key in client_states[0]:
+
+        first_tensor = client_states[0][key]
+
+        if torch.is_floating_point(first_tensor):
+            aggregated = torch.zeros_like(
+                first_tensor
             )
-        )
 
-        for client_index in range(
-            1,
-            len(client_states)
-        ):
-
-            global_state[key] += (
-                client_states[client_index][key]
-                * (
+            for client_index in range(
+                len(client_states)
+            ):
+                weight = (
                     client_sizes[client_index]
                     / total_samples
                 )
+
+                aggregated += (
+                    client_states[client_index][key]
+                    * weight
+                )
+
+            global_state[key] = aggregated
+
+        else:
+            # Non-floating buffers such as
+            # num_batches_tracked cannot be
+            # meaningfully averaged as floats.
+            global_state[key] = (
+                first_tensor.clone()
             )
 
     return global_state
@@ -197,9 +216,8 @@ def evaluate_global_model(
     model,
     loader,
     criterion,
-    device
+    device,
 ):
-
     model.eval()
 
     total_loss = 0.0
@@ -212,24 +230,23 @@ def evaluate_global_model(
 
             images = images.to(
                 device,
-                non_blocking=True
+                non_blocking=True,
             )
 
             labels = labels.to(
                 device,
-                non_blocking=True
+                non_blocking=True,
             )
 
             outputs = model(images)
 
             loss = criterion(
                 outputs,
-                labels
+                labels,
             )
 
             total_loss += (
-                loss.item() *
-                images.size(0)
+                loss.item() * images.size(0)
             )
 
             predictions = outputs.argmax(
@@ -263,17 +280,15 @@ def main():
 
     os.makedirs(
         MODEL_DIR,
-        exist_ok=True
+        exist_ok=True,
     )
 
     os.makedirs(
         RESULTS_DIR,
-        exist_ok=True
+        exist_ok=True,
     )
 
-    print(
-        "===== FEDAVG TRAINING ====="
-    )
+    print("\n===== FEDAVG TRAINING =====")
 
     print("Device:", DEVICE)
     print("Model: DenseNet121")
@@ -290,23 +305,61 @@ def main():
     # LOAD CLIENT MAP
     # --------------------------------------------------------
 
-    print(
-        "\n===== LOADING CLIENT DATA ====="
-    )
+    print("\n===== LOADING CLIENT DATA =====")
+
+    if not os.path.exists(CLIENT_MAP_FILE):
+        raise FileNotFoundError(
+            f"Client map not found:\n{CLIENT_MAP_FILE}\n\n"
+            "Generate the federated client map first."
+        )
 
     client_df = pd.read_csv(
         CLIENT_MAP_FILE
     )
 
+    required_columns = {
+        "client_id",
+        "patient_key",
+        "pneumonia",
+    }
+
+    missing_columns = (
+        required_columns
+        - set(client_df.columns)
+    )
+
+    if missing_columns:
+        raise ValueError(
+            "Client map is missing required columns: "
+            f"{sorted(missing_columns)}"
+        )
+
     print(
         "Federated training images:",
-        len(client_df)
+        len(client_df),
     )
 
     print(
         "Federated patients:",
-        client_df["patient_key"].nunique()
+        client_df["patient_key"].nunique(),
     )
+
+    # Verify all expected clients exist.
+    actual_clients = sorted(
+        client_df["client_id"]
+        .unique()
+        .tolist()
+    )
+
+    expected_clients = list(
+        range(1, NUM_CLIENTS + 1)
+    )
+
+    if actual_clients != expected_clients:
+        raise ValueError(
+            f"Expected clients {expected_clients}, "
+            f"but found {actual_clients}"
+        )
 
     # --------------------------------------------------------
     # LOAD VALIDATION DATA
@@ -316,7 +369,7 @@ def main():
         CSV_FILE,
         "val",
         get_transforms(train=False),
-        path_column=PATH_COLUMN
+        path_column=PATH_COLUMN,
     )
 
     val_loader = DataLoader(
@@ -324,12 +377,12 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=0,
-        pin_memory=torch.cuda.is_available()
+        pin_memory=torch.cuda.is_available(),
     )
 
     print(
         "Validation images:",
-        len(val_dataset)
+        len(val_dataset),
     )
 
     # --------------------------------------------------------
@@ -337,34 +390,38 @@ def main():
     # --------------------------------------------------------
 
     client_datasets = []
-
     client_loaders = []
 
-    print(
-        "\n===== CLIENT DISTRIBUTION ====="
-    )
+    print("\n===== CLIENT DISTRIBUTION =====")
 
     for client_id in range(
         1,
-        NUM_CLIENTS + 1
+        NUM_CLIENTS + 1,
     ):
 
         client_subset = client_df[
-            client_df["client_id"] ==
-            client_id
+            client_df["client_id"]
+            == client_id
         ].copy()
+
+        if len(client_subset) == 0:
+            raise ValueError(
+                f"Client {client_id} has no images."
+            )
 
         client_dataset = RSNADataset(
             CSV_FILE,
             "train",
             get_transforms(train=True),
-            path_column=PATH_COLUMN
+            path_column=PATH_COLUMN,
         )
 
-        # Replace dataset dataframe with
-        # this client's patient-level subset.
-        client_dataset.df = client_subset.reset_index(
-            drop=True
+        # Replace the full training dataframe
+        # with this client's patient-level subset.
+        client_dataset.df = (
+            client_subset.reset_index(
+                drop=True
+            )
         )
 
         client_loader = DataLoader(
@@ -372,7 +429,7 @@ def main():
             batch_size=BATCH_SIZE,
             shuffle=True,
             num_workers=0,
-            pin_memory=torch.cuda.is_available()
+            pin_memory=torch.cuda.is_available(),
         )
 
         client_datasets.append(
@@ -391,20 +448,24 @@ def main():
             client_subset["pneumonia"] == 0
         ).sum()
 
+        pneumonia_ratio = (
+            pneumonia_count / len(client_subset)
+        )
+
         print(
             f"Client {client_id}: "
             f"{len(client_subset)} images | "
+            f"{client_subset['patient_key'].nunique()} patients | "
             f"Pneumonia: {pneumonia_count} | "
-            f"No pneumonia: {no_pneumonia_count}"
+            f"No pneumonia: {no_pneumonia_count} | "
+            f"Pneumonia ratio: {pneumonia_ratio:.3f}"
         )
 
     # --------------------------------------------------------
     # GLOBAL MODEL
     # --------------------------------------------------------
 
-    print(
-        "\n===== CREATING GLOBAL MODEL ====="
-    )
+    print("\n===== CREATING GLOBAL MODEL =====")
 
     global_model = create_model()
 
@@ -414,31 +475,31 @@ def main():
 
     print(
         "Classifier:",
-        global_model.classifier
+        global_model.classifier,
     )
 
     # --------------------------------------------------------
-    # TRAINING LOSS
+    # GLOBAL TRAINING LOSS
     # --------------------------------------------------------
 
-    # Use the overall federated training distribution
-    # for the global loss function.
     global_labels = (
         client_df["pneumonia"].values
     )
 
     class_counts = np.bincount(
-        global_labels
+        global_labels,
+        minlength=2,
     )
 
-    class_weights = len(global_labels) / (
-        2 * class_counts
+    class_weights = (
+        len(global_labels)
+        / (2 * class_counts)
     )
 
     class_weights = torch.tensor(
         class_weights,
         dtype=torch.float32,
-        device=DEVICE
+        device=DEVICE,
     )
 
     criterion = nn.CrossEntropyLoss(
@@ -447,12 +508,12 @@ def main():
 
     print(
         "Class counts:",
-        class_counts
+        class_counts,
     )
 
     print(
         "Class weights:",
-        class_weights
+        class_weights,
     )
 
     # --------------------------------------------------------
@@ -462,14 +523,13 @@ def main():
     history = []
 
     best_val_loss = float("inf")
+    best_round = None
 
-    print(
-        "\n===== STARTING FEDAVG ====="
-    )
+    print("\n===== STARTING FEDAVG =====")
 
     for round_number in range(
         1,
-        NUM_ROUNDS + 1
+        NUM_ROUNDS + 1,
     ):
 
         round_start = time.time()
@@ -493,15 +553,17 @@ def main():
             NUM_CLIENTS
         ):
 
-            client_id = client_index + 1
+            client_id = (
+                client_index + 1
+            )
 
             print(
                 f"\nClient {client_id} "
                 f"local training..."
             )
 
-            # Start client from the current
-            # global model.
+            # Each client starts from the
+            # current global model.
             local_model = create_model()
 
             local_model.load_state_dict(
@@ -515,18 +577,21 @@ def main():
             optimizer = torch.optim.AdamW(
                 local_model.parameters(),
                 lr=LEARNING_RATE,
-                weight_decay=WEIGHT_DECAY
+                weight_decay=WEIGHT_DECAY,
             )
 
-            state_dict, local_loss, local_accuracy, client_size = (
-                train_local_model(
-                    local_model,
-                    client_loaders[client_index],
-                    criterion,
-                    optimizer,
-                    DEVICE,
-                    LOCAL_EPOCHS
-                )
+            (
+                state_dict,
+                local_loss,
+                local_accuracy,
+                client_size,
+            ) = train_local_model(
+                local_model,
+                client_loaders[client_index],
+                criterion,
+                optimizer,
+                DEVICE,
+                LOCAL_EPOCHS,
             )
 
             client_states.append(
@@ -567,7 +632,7 @@ def main():
 
         global_state = fedavg(
             client_states,
-            client_sizes
+            client_sizes,
         )
 
         global_model.load_state_dict(
@@ -583,7 +648,7 @@ def main():
                 global_model,
                 val_loader,
                 criterion,
-                DEVICE
+                DEVICE,
             )
         )
 
@@ -591,14 +656,18 @@ def main():
             time.time() - round_start
         )
 
-        average_client_loss = np.average(
-            client_losses,
-            weights=client_sizes
+        average_client_loss = (
+            np.average(
+                client_losses,
+                weights=client_sizes,
+            )
         )
 
-        average_client_accuracy = np.average(
-            client_accuracies,
-            weights=client_sizes
+        average_client_accuracy = (
+            np.average(
+                client_accuracies,
+                weights=client_sizes,
+            )
         )
 
         print(
@@ -634,19 +703,21 @@ def main():
         # SAVE HISTORY
         # ----------------------------------------------------
 
-        history.append({
-            "round": round_number,
-            "weighted_client_loss":
-                average_client_loss,
-            "weighted_client_accuracy":
-                average_client_accuracy,
-            "validation_loss":
-                val_loss,
-            "validation_accuracy":
-                val_accuracy,
-            "round_time_minutes":
-                round_time / 60
-        })
+        history.append(
+            {
+                "round": round_number,
+                "weighted_client_loss":
+                    average_client_loss,
+                "weighted_client_accuracy":
+                    average_client_accuracy,
+                "validation_loss":
+                    val_loss,
+                "validation_accuracy":
+                    val_accuracy,
+                "round_time_minutes":
+                    round_time / 60,
+            }
+        )
 
         history_df = pd.DataFrame(
             history
@@ -654,20 +725,23 @@ def main():
 
         history_df.to_csv(
             HISTORY_PATH,
-            index=False
+            index=False,
         )
 
         # ----------------------------------------------------
-        # BEST GLOBAL MODEL
+        # SAVE BEST GLOBAL MODEL
         # ----------------------------------------------------
 
         if val_loss < best_val_loss:
 
             best_val_loss = val_loss
+            best_round = round_number
 
             checkpoint = {
                 "model_state_dict":
-                    global_model.state_dict(),
+                    copy.deepcopy(
+                        global_model.state_dict()
+                    ),
 
                 "round":
                     round_number,
@@ -691,16 +765,19 @@ def main():
                     LOCAL_EPOCHS,
 
                 "seed":
-                    SEED
+                    SEED,
             }
 
             torch.save(
                 checkpoint,
-                BEST_MODEL_PATH
+                BEST_MODEL_PATH,
             )
 
             print(
-                "Best global model saved:",
+                "\nBest global model saved:"
+            )
+
+            print(
                 BEST_MODEL_PATH
             )
 
@@ -714,17 +791,22 @@ def main():
 
     print(
         "Best validation loss:",
-        f"{best_val_loss:.4f}"
+        f"{best_val_loss:.4f}",
+    )
+
+    print(
+        "Best round:",
+        best_round,
     )
 
     print(
         "Best global model:",
-        BEST_MODEL_PATH
+        BEST_MODEL_PATH,
     )
 
     print(
         "Training history:",
-        HISTORY_PATH
+        HISTORY_PATH,
     )
 
 
