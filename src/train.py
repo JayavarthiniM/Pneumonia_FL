@@ -3,6 +3,7 @@ import random
 import time
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -19,6 +20,7 @@ from config import (
     WEIGHT_DECAY,
     DEVICE,
     MODEL_DIR,
+    RESULTS_DIR,
     SEED,
 )
 
@@ -184,6 +186,11 @@ def main():
         exist_ok=True
     )
 
+    os.makedirs(
+        RESULTS_DIR,
+        exist_ok=True
+    )
+
     print("===== CENTRALIZED TRAINING =====")
 
     print("Device:", DEVICE)
@@ -317,6 +324,12 @@ def main():
     )
 
     # =========================
+    # Training history
+    # =========================
+
+    history = []
+
+    # =========================
     # Best model tracking
     # =========================
 
@@ -327,9 +340,19 @@ def main():
         "densenet121_centralized_best.pth"
     )
 
+    history_path = os.path.join(
+        RESULTS_DIR,
+        "centralized_training_history.csv"
+    )
+
     print(
         "\nBest model will be saved to:",
         best_model_path
+    )
+
+    print(
+        "Training history will be saved to:",
+        history_path
     )
 
     # =========================
@@ -367,6 +390,32 @@ def main():
 
         elapsed_time = (
             time.time() - start_time
+        )
+
+        # -------------------------
+        # Store history
+        # -------------------------
+
+        epoch_record = {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "train_accuracy": train_accuracy,
+            "val_loss": val_loss,
+            "val_accuracy": val_accuracy,
+            "time_minutes": elapsed_time / 60
+        }
+
+        history.append(
+            epoch_record
+        )
+
+        history_df = pd.DataFrame(
+            history
+        )
+
+        history_df.to_csv(
+            history_path,
+            index=False
         )
 
         # -------------------------
@@ -459,6 +508,11 @@ def main():
     print(
         "Best model:",
         best_model_path
+    )
+
+    print(
+        "Training history:",
+        history_path
     )
 
 
